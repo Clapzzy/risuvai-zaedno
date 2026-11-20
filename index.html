@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>Рисувай Заедно</title>
-<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
 <style>
   :root { --bg:#f4f1ea; --panel:#fff; --ink:#222; --muted:#777; --accent:#ff5a36; --line:#e2ddd3; }
@@ -127,223 +127,270 @@
 <div id="toast"></div>
 
 <script>
-const PREFIX = 'risuvai-zaedno-v1-';
+/* =====================================================================
+   Рисувай Заедно — real-time collaborative drawing between devices.
+   Transport: WebSockets (MQTT over wss://) to two free public brokers.
+   Every message is published to ALL brokers and de-duplicated on
+   receipt, so the room keeps working even if one server is down.
+   WebSockets go over normal HTTPS, so they work on any Wi-Fi / mobile
+   network (no NAT / TURN problems like WebRTC).
+   ===================================================================== */
+const BROKERS = [
+  { url: 'wss://public.cloud.shiftr.io', username: 'public', password: 'public' }, // port 443: passes strict school firewalls
+  { url: 'wss://test.mosquitto.org:8081' },
+  { url: 'wss://broker.hivemq.com:8884/mqtt' },
+];
+const PREFIX = 'risuvai-zaedno-v2/';
 const COLORS = ['#222222','#e53935','#fb8c00','#fdd835','#43a047','#1e88e5','#8e24aa','#ff80ab','#795548'];
 const PLAYER_COLORS = ['#e53935','#1e88e5','#43a047','#fb8c00','#8e24aa','#00897b','#d81b60','#6d4c41','#3949ab','#c0ca33'];
+const PING_MS = 2000, TIMEOUT_MS = 8000;
 const $ = id => document.getElementById(id);
 
-let peer, isHost = false, roomCode = '', myId = '', myName = '', myColor = '';
-let hostConn = null;            // guest -> host connection
-const conns = new Map();        // host: peerId -> DataConnection
-const players = new Map();      // id -> {name, color}
-let strokes = [];               // host: full history for late joiners
-const lastSeen = new Map();     // host: peerId -> last message time (heartbeat)
-let hostLastSeen = Date.now();  // guest: last message from host
+const myId = Math.random().toString(36).slice(2, 10);
+let roomCode = '', myName = '', myColor = '#999', myJoinedAt = 0;
+let clients = [];                 // MQTT connections (one per broker)
+let inRoom = false;               // entered the drawing screen
+let wantState = false, stateBuf = null, pendingSegs = [];
+let seq = 0;
+const players = new Map();        // id -> {name, color, joinedAt, lastSeen}
+let strokes = [];                 // full drawing history (everyone keeps a copy)
 let brush = { color: COLORS[0], size: 6, eraser: false };
 
 /* ---------- Lobby ---------- */
 const params = new URLSearchParams(location.search);
 if (params.get('room')) $('codeInput').value = params.get('room').toUpperCase();
-$('nameInput').value = localStorageGet('name') || '';
-
+$('nameInput').value = storageGet('name') || '';
 $('createBtn').onclick = () => start(true);
 $('joinBtn').onclick = () => start(false);
 $('codeInput').addEventListener('keydown', e => { if (e.key === 'Enter') start(false); });
 
-function localStorageGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
-function localStorageSet(k, v) { try { localStorage.setItem(k, v); } catch {} }
+function storageGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
+function storageSet(k, v) { try { localStorage.setItem(k, v); } catch {} }
 
 function randomCode() {
   const a = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   return Array.from({ length: 5 }, () => a[Math.floor(Math.random() * a.length)]).join('');
 }
 
-function start(asHost) {
-  myName = $('nameInput').value.trim() || 'Гост' + Math.floor(Math.random() * 100);
-  localStorageSet('name', myName);
-  $('lobbyMsg').textContent = '';
-  if (asHost) {
-    isHost = true;
-    roomCode = randomCode();
-    myColor = PLAYER_COLORS[0];
-    createPeer(PREFIX + roomCode);
-  } else {
-    roomCode = $('codeInput').value.trim().toUpperCase();
-    if (roomCode.length !== 5) { $('lobbyMsg').textContent = 'Въведи 5-символен код на стая.'; return; }
-    isHost = false;
-    createPeer(undefined);
-  }
-}
-
-function createPeer(id) {
-  $('createBtn').disabled = $('joinBtn').disabled = true;
-  $('lobbyMsg').style.color = '#777';
-  $('lobbyMsg').textContent = 'Свързване със сървъра…';
-  peer = id ? new Peer(id) : new Peer();
-
-  peer.on('open', pid => {
-    myId = pid;
-    if (isHost) {
-      players.set(myId, { name: myName, color: myColor });
-      enterApp();
-      setStatus(true, 'ти си домакин');
-      sysMsg('Стаята е създадена. Покани други с кода ' + roomCode + ' или QR кода.');
-    } else {
-      joinRoom();
-    }
-  });
-
-  peer.on('connection', conn => { if (isHost) handleGuest(conn); else conn.close(); });
-
-  peer.on('error', err => {
-    console.error(err);
-    if (err.type === 'unavailable-id') { peer.destroy(); start(true); return; } // code collision, try another
-    if (err.type === 'peer-unavailable') { lobbyError('Няма стая с код ' + roomCode + '.'); return; }
-    if ($('app').classList.contains('hidden')) lobbyError('Грешка при свързване: ' + err.type);
-    else toast('Грешка: ' + err.type);
-  });
-
-  peer.on('disconnected', () => { if (!peer.destroyed) peer.reconnect(); });
+function lobbyStatus(msg, isError) {
+  $('lobbyMsg').style.color = isError ? '#c62828' : '#777';
+  $('lobbyMsg').textContent = msg;
 }
 
 function lobbyError(msg) {
-  $('lobbyMsg').style.color = '#c62828';
-  $('lobbyMsg').textContent = msg;
+  lobbyStatus(msg, true);
   $('createBtn').disabled = $('joinBtn').disabled = false;
-  if (peer) peer.destroy();
+  disconnectAll();
 }
 
-/* ---------- Host side ---------- */
-function handleGuest(conn) {
-  conn.on('open', () => {
-    conns.set(conn.peer, conn);
-    lastSeen.set(conn.peer, Date.now());
+async function start(create) {
+  myName = $('nameInput').value.trim() || 'Гост' + Math.floor(Math.random() * 100);
+  storageSet('name', myName);
+  roomCode = create ? randomCode() : $('codeInput').value.trim().toUpperCase();
+  if (!create && roomCode.length !== 5) { lobbyStatus('Въведи 5-символен код на стая.', true); return; }
+  $('createBtn').disabled = $('joinBtn').disabled = true;
+  lobbyStatus('Свързване със сървъра…');
+
+  try { await connectAll(); }
+  catch { lobbyError('Няма връзка със сървъра. Провери интернета и опитай пак.'); return; }
+
+  if (create) {
+    myColor = PLAYER_COLORS[0];
+    myJoinedAt = Date.now();
+    players.set(myId, { name: myName, color: myColor, joinedAt: myJoinedAt, lastSeen: Date.now() });
+    enterApp();
+    sysMsg('Стаята е създадена. Покани други с кода ' + roomCode + ' или QR кода.');
+    sendPing();
+  } else {
+    lobbyStatus('Влизане в стая ' + roomCode + '…');
+    requestState();
+    let tries = 0;
+    const retry = setInterval(() => {
+      if (inRoom) return clearInterval(retry);
+      if (++tries >= 4) { clearInterval(retry); lobbyError('Няма активна стая с код ' + roomCode + '. Провери кода (стаята е активна, докато някой е вътре).'); return; }
+      requestState(); // resend in case the first message was lost
+    }, 3000);
+  }
+}
+
+/* ---------- Networking (MQTT over WebSockets) ---------- */
+function topicAll() { return PREFIX + roomCode + '/all'; }
+function topicMe() { return PREFIX + roomCode + '/to/' + myId; }
+
+function connectAll() {
+  return new Promise((resolve, reject) => {
+    let settled = false, failed = 0;
+    clients = BROKERS.map(({ url, username, password }) => {
+      const c = mqtt.connect(url, {
+        username, password,
+        clientId: 'rz_' + myId + '_' + Math.random().toString(36).slice(2, 6),
+        connectTimeout: 10000, reconnectPeriod: 2000, keepalive: 30, clean: true,
+      });
+      let everConnected = false;
+      c.on('connect', () => {
+        c.subscribe([topicAll(), topicMe()]);
+        if (!settled) { settled = true; resolve(); }
+        else if (everConnected && inRoom) requestState(true); // came back after a drop: resync the drawing
+        everConnected = true;
+        updateStatus();
+      });
+      c.on('message', (topic, payload) => { try { onMessage(JSON.parse(payload.toString())); } catch (e) { console.warn(e); } });
+      c.on('close', updateStatus);
+      c.on('offline', updateStatus);
+      c.on('error', e => console.warn(url, e.message));
+      return c;
+    });
+    setTimeout(() => { if (!settled) { settled = true; reject(new Error('timeout')); } }, 15000);
   });
-  conn.on('data', msg => { lastSeen.set(conn.peer, Date.now()); onHostData(conn, msg); });
-  conn.on('close', () => removeGuest(conn.peer));
-  conn.on('error', () => removeGuest(conn.peer));
 }
 
-function removeGuest(id) {
-  if (!conns.has(id)) return;
-  try { conns.get(id).close(); } catch {}
-  conns.delete(id);
-  lastSeen.delete(id);
-  const p = players.get(id);
-  players.delete(id);
-  removeCursor(id);
-  renderPlayers();
-  if (p) { sysMsg(p.name + ' излезе'); broadcast({ t: 'leave', id, name: p.name }); }
-  broadcast({ t: 'players', list: [...players] });
+function disconnectAll() { clients.forEach(c => c.end(true)); clients = []; }
+
+function publish(topic, msg) {
+  msg.f = myId; msg.q = ++seq;
+  const data = JSON.stringify(msg);
+  clients.forEach(c => { if (c.connected) c.publish(topic, data); });
+}
+const send = msg => publish(topicAll(), msg);
+const sendTo = (id, msg) => publish(PREFIX + roomCode + '/to/' + id, msg);
+
+// de-duplicate: each message arrives once per broker
+const seen = new Map();
+function isDuplicate(m) {
+  let s = seen.get(m.f);
+  if (!s) seen.set(m.f, s = new Set());
+  if (s.has(m.q)) return true;
+  s.add(m.q);
+  if (s.size > 2000) s.delete(s.values().next().value);
+  return false;
 }
 
-function onHostData(conn, msg) {
-  switch (msg.t) {
+function updateStatus() {
+  const n = clients.filter(c => c.connected).length;
+  if (!inRoom) return;
+  $('dot').classList.toggle('on', n > 0);
+  $('statusText').textContent = n > 0 ? 'свързан (' + n + '/' + clients.length + ' сървъра)' : 'няма връзка, опитвам отново…';
+}
+
+function requestState(resync) {
+  wantState = true; stateBuf = null;
+  send({ t: 'hello', name: myName, color: myColor, joinedAt: myJoinedAt, resync: !!resync });
+}
+
+function sendPing() { send({ t: 'ping', name: myName, color: myColor, joinedAt: myJoinedAt }); }
+
+function upsertPlayer(m) {
+  const isNew = !players.has(m.f);
+  const p = players.get(m.f) || {};
+  Object.assign(p, { name: String(m.name || '?').slice(0, 16), color: m.color || '#999', joinedAt: m.joinedAt || 0, lastSeen: Date.now() });
+  players.set(m.f, p);
+  if (isNew) renderPlayers();
+  return isNew;
+}
+
+// the longest-present member answers newcomers with the drawing history
+function iAmResponder(exceptId) {
+  let best = null;
+  for (const [id, p] of players) {
+    if (id === exceptId || !p.joinedAt) continue;
+    if (!best || p.joinedAt < best.p.joinedAt || (p.joinedAt === best.p.joinedAt && id < best.id)) best = { id, p };
+  }
+  return best && best.id === myId;
+}
+
+function sendState(to) {
+  const CHUNK = 400, total = Math.max(1, Math.ceil(strokes.length / CHUNK));
+  const list = [...players].map(([id, p]) => [id, { name: p.name, color: p.color, joinedAt: p.joinedAt }]);
+  for (let i = 0; i < total; i++)
+    sendTo(to, { t: 'state', part: i, total, segs: strokes.slice(i * CHUNK, (i + 1) * CHUNK), players: i === 0 ? list : undefined });
+}
+
+function onMessage(m) {
+  if (!m || m.f === myId || isDuplicate(m)) return;
+  const p = players.get(m.f);
+  if (p) p.lastSeen = Date.now();
+
+  switch (m.t) {
     case 'hello': {
-      const used = new Set([...players.values()].map(p => p.color));
-      const color = PLAYER_COLORS.find(c => !used.has(c)) || PLAYER_COLORS[players.size % PLAYER_COLORS.length];
-      players.set(conn.peer, { name: String(msg.name).slice(0, 16), color });
-      conn.send({ t: 'welcome', you: conn.peer, color, strokes, players: [...players] });
-      broadcast({ t: 'players', list: [...players] }, conn.peer);
-      broadcast({ t: 'join', name: msg.name }, conn.peer);
-      renderPlayers();
-      sysMsg(msg.name + ' влезе');
+      if (!inRoom) return;
+      if (m.joinedAt) upsertPlayer(m); // a returning member re-syncing
+      if (iAmResponder(m.f)) sendState(m.f);
       break;
     }
-    case 'seg':
-      strokes.push(msg.s);
-      drawSeg(msg.s);
-      broadcast(msg, conn.peer);
+    case 'ping': {
+      if (!inRoom) return;
+      if (upsertPlayer(m)) sysMsg(players.get(m.f).name + ' влезе');
+      else renderPlayers();
+      break;
+    }
+    case 'bye': removePlayer(m.f); break;
+    case 'state': onState(m); break;
+    case 'segs':
+      if (!inRoom || wantState) { pendingSegs.push(...m.s); return; }
+      m.s.forEach(s => { strokes.push(s); drawSeg(s); });
       break;
     case 'clear':
       strokes = []; clearBoard();
-      broadcast(msg, conn.peer);
-      sysMsg((players.get(conn.peer)?.name || '?') + ' изчисти платното');
+      sysMsg((p ? p.name : 'Някой') + ' изчисти платното');
       break;
-    case 'chat': {
-      const p = players.get(conn.peer);
+    case 'chat':
       if (!p) return;
-      const out = { t: 'chat', name: p.name, color: p.color, text: String(msg.text).slice(0, 200) };
-      chatMsg(out);
-      broadcast(out, conn.peer);
+      chatMsg({ name: p.name, color: p.color, text: String(m.text).slice(0, 200) });
       break;
-    }
-    case 'ping': break;
-    case 'bye': removeGuest(conn.peer); break;
-    case 'cursor':
-      msg.id = conn.peer;
-      showCursor(msg.id, msg.x, msg.y);
-      broadcast(msg, conn.peer);
-      break;
+    case 'cur': if (p) showCursor(m.f, m.x, m.y); break;
   }
 }
 
-function broadcast(msg, exceptId) {
-  for (const [id, c] of conns) if (id !== exceptId && c.open) c.send(msg);
-}
+function onState(m) {
+  if (!wantState) return;
+  if (!stateBuf || stateBuf.total !== m.total) stateBuf = { total: m.total, parts: [], from: m.f };
+  if (m.f !== stateBuf.from) return; // only use one responder's copy
+  stateBuf.parts[m.part] = m;
+  if (stateBuf.parts.filter(Boolean).length < m.total) return;
 
-/* ---------- Guest side ---------- */
-function joinRoom() {
-  $('lobbyMsg').textContent = 'Влизане в стая ' + roomCode + '…';
-  hostConn = peer.connect(PREFIX + roomCode, { reliable: true });
-  const timeout = setTimeout(() => { if (!hostConn.open) lobbyError('Стаята не отговаря. Провери кода.'); }, 15000);
-  hostConn.on('open', () => {
-    clearTimeout(timeout);
-    hostConn.send({ t: 'hello', name: myName });
-  });
-  hostConn.on('data', onGuestData);
-  hostConn.on('close', hostGone);
-}
+  const parts = stateBuf.parts; wantState = false; stateBuf = null;
+  const first = parts[0];
+  const firstJoin = !inRoom;
+  if (first.players) for (const [id, info] of first.players) if (id !== myId) players.set(id, { ...info, lastSeen: Date.now() });
 
-function hostGone() {
-  if (!hostConn || hostConn._gone) return;
-  hostConn._gone = true;
-  setStatus(false, 'връзката с домакина е прекъсната');
-  sysMsg('Домакинът напусна. Стаята е затворена.');
-}
-
-function onGuestData(msg) {
-  hostLastSeen = Date.now();
-  switch (msg.t) {
-    case 'ping': break;
-    case 'bye': hostGone(); break;
-    case 'welcome':
-      myColor = msg.color;
-      enterApp();
-      setStatus(true, 'свързан');
-      players.clear(); msg.players.forEach(([id, p]) => players.set(id, p));
-      renderPlayers();
-      msg.strokes.forEach(drawSeg);
-      sysMsg('Влезе в стая ' + roomCode);
-      break;
-    case 'players':
-      players.clear(); msg.list.forEach(([id, p]) => players.set(id, p));
-      renderPlayers();
-      break;
-    case 'join': sysMsg(msg.name + ' влезе'); break;
-    case 'leave': sysMsg(msg.name + ' излезе'); removeCursor(msg.id); break;
-    case 'seg': drawSeg(msg.s); break;
-    case 'clear': clearBoard(); sysMsg('Платното беше изчистено'); break;
-    case 'chat': chatMsg(msg); break;
-    case 'cursor': showCursor(msg.id, msg.x, msg.y); break;
+  if (firstJoin) {
+    const used = new Set([...players.values()].map(x => x.color));
+    myColor = PLAYER_COLORS.find(c => !used.has(c)) || PLAYER_COLORS[players.size % PLAYER_COLORS.length];
+    myJoinedAt = Date.now();
+    players.set(myId, { name: myName, color: myColor, joinedAt: myJoinedAt, lastSeen: Date.now() });
+    enterApp();
+    sysMsg('Влезе в стая ' + roomCode);
   }
+  strokes = parts.flatMap(x => x.segs);
+  clearBoard(); strokes.forEach(drawSeg);
+  pendingSegs.forEach(s => { strokes.push(s); drawSeg(s); }); pendingSegs = [];
+  renderPlayers();
+  sendPing(); // announce myself (with my colour) to everyone
 }
 
-/* send from me (host or guest) */
-function send(msg) {
-  if (isHost) broadcast(msg);
-  else if (hostConn && hostConn.open) hostConn.send(msg);
+function removePlayer(id) {
+  const p = players.get(id);
+  if (!p || id === myId) return;
+  players.delete(id); removeCursor(id); renderPlayers();
+  sysMsg(p.name + ' излезе');
 }
+
+/* heartbeat: tell others we're here, drop players we haven't heard from */
+setInterval(() => {
+  if (!inRoom) return;
+  sendPing();
+  const me = players.get(myId); if (me) me.lastSeen = Date.now();
+  for (const [id, p] of players) if (id !== myId && Date.now() - p.lastSeen > TIMEOUT_MS) removePlayer(id);
+}, PING_MS);
 
 /* ---------- App UI ---------- */
 function enterApp() {
+  inRoom = true;
   $('lobby').classList.add('hidden');
   $('app').classList.remove('hidden');
   $('roomCode').textContent = roomCode;
   history.replaceState(null, '', '?room=' + roomCode);
-  buildTools();
-  renderPlayers();
-  renderQR();
+  buildTools(); renderPlayers(); renderQR(); updateStatus();
 }
 
 function joinLink() { return location.origin + location.pathname + '?room=' + roomCode; }
@@ -361,18 +408,17 @@ $('copyBtn').onclick = async () => {
   catch { prompt('Копирай линка:', joinLink()); }
 };
 
-function setStatus(on, text) { $('dot').classList.toggle('on', on); $('statusText').textContent = text; }
-
 function renderPlayers() {
-  $('playerCount').textContent = players.size;
+  const list = [...players].sort((a, b) => a[1].joinedAt - b[1].joinedAt);
+  $('playerCount').textContent = list.length;
   $('players').innerHTML = '';
-  for (const [id, p] of players) {
+  list.forEach(([id, p], i) => {
     const li = document.createElement('li');
     li.innerHTML = '<i></i><span></span>';
     li.querySelector('i').style.background = p.color;
-    li.querySelector('span').textContent = p.name + (id === myId ? ' (ти)' : '') + (id === PREFIX + roomCode ? ' 👑' : '');
+    li.querySelector('span').textContent = p.name + (id === myId ? ' (ти)' : '') + (i === 0 ? ' 👑' : '');
     $('players').appendChild(li);
-  }
+  });
 }
 
 function buildTools() {
@@ -392,7 +438,7 @@ function buildTools() {
   er.onclick = () => { brush.eraser = !brush.eraser; updateToolUI(); };
   t.appendChild(er);
   const cl = document.createElement('button'); cl.textContent = 'Изчисти'; cl.className = 'secondary';
-  cl.onclick = () => { if (!confirm('Да изчистя ли платното за всички?')) return; clearBoard(); if (isHost) strokes = []; send({ t: 'clear' }); };
+  cl.onclick = () => { if (!confirm('Да изчистя ли платното за всички?')) return; strokes = []; clearBoard(); send({ t: 'clear' }); };
   t.appendChild(cl);
   const sv = document.createElement('button'); sv.textContent = 'Запази'; sv.className = 'secondary';
   sv.onclick = () => { const a = document.createElement('a'); a.download = 'risunka-' + roomCode + '.png'; a.href = board.toDataURL(); a.click(); };
@@ -405,17 +451,18 @@ function updateToolUI(activeSwatch) {
 }
 
 /* ---------- Drawing ---------- */
+// a segment is a compact array: [x0, y0, x1, y1, color, width, eraser]
 const board = $('board');
 const ctx = board.getContext('2d');
 ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-let last = null, lastCursorSent = 0;
+let last = null, outbox = [], lastCursorSent = 0;
 
 function clearBoard() { ctx.clearRect(0, 0, board.width, board.height); }
 
 function drawSeg(s) {
-  ctx.globalCompositeOperation = s.e ? 'destination-out' : 'source-over';
-  ctx.strokeStyle = s.c; ctx.lineWidth = s.w;
-  ctx.beginPath(); ctx.moveTo(s.x0, s.y0); ctx.lineTo(s.x1, s.y1); ctx.stroke();
+  ctx.globalCompositeOperation = s[6] ? 'destination-out' : 'source-over';
+  ctx.strokeStyle = s[4]; ctx.lineWidth = s[5];
+  ctx.beginPath(); ctx.moveTo(s[0], s[1]); ctx.lineTo(s[2], s[3]); ctx.stroke();
   ctx.globalCompositeOperation = 'source-over';
 }
 
@@ -427,12 +474,12 @@ function pos(e) {
 board.addEventListener('pointerdown', e => {
   board.setPointerCapture(e.pointerId);
   last = pos(e);
-  addSeg(last, { x: last.x + 0.1, y: last.y }); // dot on tap
+  addSeg(last, { x: last.x + 0.1, y: last.y }); // a dot on tap
 });
 board.addEventListener('pointermove', e => {
   const p = pos(e);
   const now = performance.now();
-  if (now - lastCursorSent > 50) { lastCursorSent = now; send({ t: 'cursor', id: myId, x: p.x / board.width, y: p.y / board.height }); }
+  if (now - lastCursorSent > 100) { lastCursorSent = now; send({ t: 'cur', x: +(p.x / board.width).toFixed(3), y: +(p.y / board.height).toFixed(3) }); }
   if (!last) return;
   addSeg(last, p);
   last = p;
@@ -440,16 +487,15 @@ board.addEventListener('pointermove', e => {
 ['pointerup', 'pointercancel', 'pointerleave'].forEach(ev => board.addEventListener(ev, () => last = null));
 
 function addSeg(a, b) {
-  const s = { x0: a.x, y0: a.y, x1: b.x, y1: b.y, c: brush.color, w: brush.eraser ? brush.size * 3 : brush.size, e: brush.eraser ? 1 : 0 };
-  drawSeg(s);
-  if (isHost) strokes.push(s);
-  send({ t: 'seg', s });
+  const s = [a.x, a.y, b.x, b.y, brush.color, brush.eraser ? brush.size * 3 : brush.size, brush.eraser ? 1 : 0];
+  drawSeg(s); strokes.push(s); outbox.push(s);
 }
+// batch segments: at most ~25 messages per second while drawing
+setInterval(() => { if (outbox.length) { send({ t: 'segs', s: outbox }); outbox = []; } }, 40);
 
 /* ---------- Cursors ---------- */
 const cursors = new Map();
 function showCursor(id, x, y) {
-  if (id === myId) return;
   const p = players.get(id); if (!p) return;
   let el = cursors.get(id);
   if (!el) {
@@ -471,9 +517,8 @@ $('chatForm').addEventListener('submit', e => {
   const text = $('chatInput').value.trim();
   if (!text) return;
   $('chatInput').value = '';
-  const msg = { t: 'chat', name: myName, color: myColor, text };
-  chatMsg(msg);
-  send(msg);
+  chatMsg({ name: myName, color: myColor, text });
+  send({ t: 'chat', text });
 });
 
 function chatMsg(m) {
@@ -487,16 +532,7 @@ function appendMsg(d) { $('messages').appendChild(d); $('messages').scrollTop = 
 
 function toast(text) { const t = $('toast'); t.textContent = text; t.classList.add('show'); clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove('show'), 2000); }
 
-/* ---------- Heartbeat: detect devices that vanish without saying goodbye ---------- */
-setInterval(() => {
-  if (!peer || $('app').classList.contains('hidden')) return;
-  send({ t: 'ping' });
-  const now = Date.now();
-  if (isHost) { for (const [id, t] of lastSeen) if (now - t > 7000) removeGuest(id); }
-  else if (hostConn && hostConn.open && now - hostLastSeen > 7000) hostGone();
-}, 2000);
-
-window.addEventListener('pagehide', () => { try { send({ t: 'bye' }); } catch {} if (peer) peer.destroy(); });
+window.addEventListener('pagehide', () => { if (inRoom) send({ t: 'bye' }); });
 </script>
 </body>
 </html>
