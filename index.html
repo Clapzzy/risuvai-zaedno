@@ -152,6 +152,8 @@ let clients = [];                 // MQTT connections (one per broker)
 let inRoom = false;               // entered the drawing screen
 let wantState = false, stateBuf = null, pendingSegs = [];
 let seq = 0;
+let epoch = 0;                    // bumps on every "clear"; segments from before a clear are ignored
+let prevId = null;                // my id before a page refresh (so others drop the old copy of me)
 const players = new Map();        // id -> {name, color, joinedAt, lastSeen}
 let strokes = [];                 // full drawing history (everyone keeps a copy)
 let brush = { color: COLORS[0], size: 6, eraser: false };
@@ -184,6 +186,7 @@ function lobbyError(msg) {
 }
 
 async function start(create) {
+  try { prevId = sessionStorage.getItem('rz-id'); sessionStorage.setItem('rz-id', myId); } catch {}
   myName = $('nameInput').value.trim() || 'Гост' + Math.floor(Math.random() * 100);
   storageSet('name', myName);
   roomCode = create ? randomCode() : $('codeInput').value.trim().toUpperCase();
@@ -224,7 +227,7 @@ function connectAll() {
       const c = mqtt.connect(url, {
         username, password,
         clientId: 'rz_' + myId + '_' + Math.random().toString(36).slice(2, 6),
-        connectTimeout: 10000, reconnectPeriod: 2000, keepalive: 30, clean: true,
+        connectTimeout: 10000, reconnectPeriod: 2000, keepalive: 10, clean: true,
       });
       let everConnected = false;
       c.on('connect', () => {
@@ -268,16 +271,42 @@ function isDuplicate(m) {
 function updateStatus() {
   const n = clients.filter(c => c.connected).length;
   if (!inRoom) return;
-  $('dot').classList.toggle('on', n > 0);
-  $('statusText').textContent = n > 0 ? 'свързан (' + n + '/' + clients.length + ' сървъра)' : 'няма връзка, опитвам отново…';
+  const ok = n > 0 && navigator.onLine !== false;
+  $('dot').classList.toggle('on', ok);
+  $('statusText').textContent = ok ? 'свързан (' + n + '/' + clients.length + ' сървъра)' : 'няма връзка, опитвам отново…';
 }
 
 function requestState(resync) {
   wantState = true; stateBuf = null;
-  send({ t: 'hello', name: myName, color: myColor, joinedAt: myJoinedAt, resync: !!resync });
+  send({ t: 'hello', name: myName, color: myColor, joinedAt: myJoinedAt, resync: !!resync, rp: prevId });
+  if (resync) setTimeout(() => { if (wantState && inRoom) { wantState = false; flushPending(); } }, 5000); // nobody answered (e.g. I'm alone)
 }
 
-function sendPing() { send({ t: 'ping', name: myName, color: myColor, joinedAt: myJoinedAt }); }
+function sendPing() { send({ t: 'ping', name: myName, color: myColor, joinedAt: myJoinedAt, rp: prevId }); }
+
+// two people picked the same colour (joined at the same moment): the later one switches
+function fixColourClash(m) {
+  if (m.color !== myColor || !players.has(m.f)) return;
+  const other = players.get(m.f);
+  if (!(other.joinedAt < myJoinedAt || (other.joinedAt === myJoinedAt && m.f < myId))) return;
+  const used = new Set([...players].filter(([id]) => id !== myId).map(([, p]) => p.color));
+  myColor = PLAYER_COLORS.find(c => !used.has(c)) || PLAYER_COLORS[Math.floor(Math.random() * PLAYER_COLORS.length)];
+  players.get(myId).color = myColor;
+  renderPlayers(); sendPing();
+}
+
+// a segment / clear from a newer "epoch" means someone cleared the board
+function syncEpoch(ep) {
+  if ((ep || 0) <= epoch) return false;
+  epoch = ep; strokes = []; outbox = []; clearBoard();
+  return true;
+}
+function applySegs(m) {
+  if ((m.ep || 0) < epoch) return; // drawn before a clear we already applied
+  syncEpoch(m.ep);
+  m.s.forEach(s => { strokes.push(s); drawSeg(s); });
+}
+function flushPending() { const p = pendingSegs; pendingSegs = []; p.forEach(applySegs); }
 
 function upsertPlayer(m) {
   const isNew = !players.has(m.f);
@@ -293,6 +322,7 @@ function iAmResponder(exceptId) {
   let best = null;
   for (const [id, p] of players) {
     if (id === exceptId || !p.joinedAt) continue;
+    if (id !== myId && Date.now() - p.lastSeen > 5000) continue; // probably gone
     if (!best || p.joinedAt < best.p.joinedAt || (p.joinedAt === best.p.joinedAt && id < best.id)) best = { id, p };
   }
   return best && best.id === myId;
@@ -302,11 +332,14 @@ function sendState(to) {
   const CHUNK = 400, total = Math.max(1, Math.ceil(strokes.length / CHUNK));
   const list = [...players].map(([id, p]) => [id, { name: p.name, color: p.color, joinedAt: p.joinedAt }]);
   for (let i = 0; i < total; i++)
-    sendTo(to, { t: 'state', part: i, total, segs: strokes.slice(i * CHUNK, (i + 1) * CHUNK), players: i === 0 ? list : undefined });
+    sendTo(to, { t: 'state', ep: epoch, part: i, total, segs: strokes.slice(i * CHUNK, (i + 1) * CHUNK), players: i === 0 ? list : undefined });
 }
 
 function onMessage(m) {
   if (!m || m.f === myId || isDuplicate(m)) return;
+  if (m.rp && m.rp !== m.f && m.rp !== myId && players.has(m.rp)) { // that device refreshed: forget its old copy
+    players.delete(m.rp); removeCursor(m.rp); renderPlayers();
+  }
   const p = players.get(m.f);
   if (p) p.lastSeen = Date.now();
 
@@ -321,16 +354,19 @@ function onMessage(m) {
       if (!inRoom) return;
       if (upsertPlayer(m)) sysMsg(players.get(m.f).name + ' влезе');
       else renderPlayers();
+      fixColourClash(m);
       break;
     }
     case 'bye': removePlayer(m.f); break;
     case 'state': onState(m); break;
     case 'segs':
-      if (!inRoom || wantState) { pendingSegs.push(...m.s); return; }
-      m.s.forEach(s => { strokes.push(s); drawSeg(s); });
+      if (!inRoom || wantState) { pendingSegs.push(m); return; }
+      applySegs(m);
       break;
     case 'clear':
-      strokes = []; clearBoard();
+      if (!inRoom || wantState) { pendingSegs.push({ s: [], ep: m.ep }); return; }
+      if ((m.ep || 0) < epoch) return;
+      syncEpoch(m.ep);
       sysMsg((p ? p.name : 'Някой') + ' изчисти платното');
       break;
     case 'chat':
@@ -361,9 +397,10 @@ function onState(m) {
     enterApp();
     sysMsg('Влезе в стая ' + roomCode);
   }
+  epoch = first.ep || 0;
   strokes = parts.flatMap(x => x.segs);
   clearBoard(); strokes.forEach(drawSeg);
-  pendingSegs.forEach(s => { strokes.push(s); drawSeg(s); }); pendingSegs = [];
+  flushPending();
   renderPlayers();
   sendPing(); // announce myself (with my colour) to everyone
 }
@@ -438,7 +475,7 @@ function buildTools() {
   er.onclick = () => { brush.eraser = !brush.eraser; updateToolUI(); };
   t.appendChild(er);
   const cl = document.createElement('button'); cl.textContent = 'Изчисти'; cl.className = 'secondary';
-  cl.onclick = () => { if (!confirm('Да изчистя ли платното за всички?')) return; strokes = []; clearBoard(); send({ t: 'clear' }); };
+  cl.onclick = () => { if (!confirm('Да изчистя ли платното за всички?')) return; epoch++; strokes = []; outbox = []; clearBoard(); send({ t: 'clear', ep: epoch }); };
   t.appendChild(cl);
   const sv = document.createElement('button'); sv.textContent = 'Запази'; sv.className = 'secondary';
   sv.onclick = () => { const a = document.createElement('a'); a.download = 'risunka-' + roomCode + '.png'; a.href = board.toDataURL(); a.click(); };
@@ -491,7 +528,7 @@ function addSeg(a, b) {
   drawSeg(s); strokes.push(s); outbox.push(s);
 }
 // batch segments: at most ~25 messages per second while drawing
-setInterval(() => { if (outbox.length) { send({ t: 'segs', s: outbox }); outbox = []; } }, 40);
+setInterval(() => { if (outbox.length) { send({ t: 'segs', s: outbox, ep: epoch }); outbox = []; } }, 40);
 
 /* ---------- Cursors ---------- */
 const cursors = new Map();
@@ -533,6 +570,18 @@ function appendMsg(d) { $('messages').appendChild(d); $('messages').scrollTop = 
 function toast(text) { const t = $('toast'); t.textContent = text; t.classList.add('show'); clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove('show'), 2000); }
 
 window.addEventListener('pagehide', () => { if (inRoom) send({ t: 'bye' }); });
+
+// phones freeze background tabs: when the user comes back, reconnect and catch up on the drawing
+let hiddenAt = 0;
+const reconnectAll = () => clients.forEach(c => { try { if (!c.connected && !c.reconnecting) c.reconnect(); } catch {} });
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { hiddenAt = Date.now(); return; }
+  if (!inRoom) return;
+  reconnectAll();
+  if (Date.now() - hiddenAt > 4000) { sendPing(); requestState(true); }
+});
+window.addEventListener('online', () => { reconnectAll(); updateStatus(); });
+window.addEventListener('offline', updateStatus);
 </script>
 </body>
 </html>
