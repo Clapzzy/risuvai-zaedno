@@ -1,0 +1,502 @@
+<!doctype html>
+<html lang="bg">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Рисувай Заедно</title>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
+<style>
+  :root { --bg:#f4f1ea; --panel:#fff; --ink:#222; --muted:#777; --accent:#ff5a36; --line:#e2ddd3; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--ink); font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif; }
+  button { font:inherit; cursor:pointer; border:0; border-radius:10px; padding:10px 14px; background:var(--ink); color:#fff; }
+  button.secondary { background:#fff; color:var(--ink); border:1px solid var(--line); }
+  input { font:inherit; padding:10px 12px; border:1px solid var(--line); border-radius:10px; width:100%; background:#fff; }
+  .hidden { display:none !important; }
+
+  /* Lobby */
+  #lobby { min-height:100%; display:flex; align-items:center; justify-content:center; padding:16px; }
+  .card { background:var(--panel); border-radius:18px; padding:28px; width:100%; max-width:400px; box-shadow:0 10px 40px rgba(0,0,0,.08); }
+  .card h1 { margin:0 0 4px; font-size:28px; }
+  .card p { margin:0 0 20px; color:var(--muted); }
+  .card label { display:block; font-size:13px; color:var(--muted); margin:14px 0 6px; }
+  .row { display:flex; gap:8px; }
+  .row input { flex:1; text-transform:uppercase; letter-spacing:2px; }
+  #createBtn { width:100%; margin-top:18px; background:var(--accent); padding:14px; font-weight:600; }
+  .or { text-align:center; color:var(--muted); margin:16px 0 0; font-size:13px; }
+  #lobbyMsg { color:#c62828; margin-top:12px; min-height:20px; font-size:14px; }
+
+  /* App */
+  #app { height:100%; display:grid; grid-template-columns: 1fr 280px; grid-template-rows: auto 1fr; }
+  header { grid-column:1/-1; display:flex; align-items:center; gap:12px; padding:8px 12px; background:#fff; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  header .room { font-weight:700; letter-spacing:2px; }
+  header .status { font-size:13px; color:var(--muted); }
+  header .dot { width:9px; height:9px; border-radius:50%; background:#bbb; display:inline-block; margin-right:4px; }
+  header .dot.on { background:#2e7d32; }
+  .tools { display:flex; align-items:center; gap:6px; margin-left:auto; flex-wrap:wrap; }
+  .swatch { width:26px; height:26px; border-radius:50%; border:3px solid #fff; box-shadow:0 0 0 1px var(--line); padding:0; }
+  .swatch.active { box-shadow:0 0 0 2px var(--ink); }
+  .tools input[type=range] { width:80px; padding:0; }
+  .tools button { padding:6px 10px; font-size:14px; }
+  .tools button.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+
+  #stage { position:relative; padding:12px; display:flex; align-items:center; justify-content:center; overflow:hidden; min-height:0; }
+  #boardWrap { position:relative; width:100%; max-height:100%; aspect-ratio: 16/10; max-width: calc((100vh - 90px) * 1.6); }
+  canvas { width:100%; height:100%; background:#fff; border-radius:12px; box-shadow:0 4px 20px rgba(0,0,0,.07); touch-action:none; display:block; cursor:crosshair; }
+  .cursor { position:absolute; pointer-events:none; transform:translate(-2px,-2px); font-size:11px; white-space:nowrap; transition: left .05s linear, top .05s linear; }
+  .cursor i { display:block; width:10px; height:10px; border-radius:50%; border:2px solid #fff; }
+  .cursor span { color:#fff; padding:1px 6px; border-radius:6px; margin:2px 0 0 8px; display:inline-block; }
+
+  aside { background:#fff; border-left:1px solid var(--line); display:flex; flex-direction:column; min-height:0; }
+  aside section { padding:12px; border-bottom:1px solid var(--line); }
+  aside h3 { margin:0 0 8px; font-size:13px; text-transform:uppercase; color:var(--muted); letter-spacing:.5px; }
+  #players { list-style:none; margin:0; padding:0; }
+  #players li { display:flex; align-items:center; gap:8px; padding:3px 0; }
+  #players li i { width:12px; height:12px; border-radius:50%; }
+  #qr { display:flex; gap:10px; align-items:center; font-size:12px; color:var(--muted); }
+  #qr img { width:96px; height:96px; image-rendering:pixelated; }
+  #chat { flex:1; display:flex; flex-direction:column; min-height:160px; padding:12px; }
+  #messages { flex:1; overflow-y:auto; font-size:14px; display:flex; flex-direction:column; gap:4px; margin-bottom:8px; }
+  #messages .sys { color:var(--muted); font-style:italic; font-size:12px; }
+  #chatForm { display:flex; gap:6px; }
+  #chatForm button { padding:8px 12px; }
+
+  #toast { position:fixed; bottom:20px; left:50%; transform:translateX(-50%); background:var(--ink); color:#fff; padding:10px 16px; border-radius:10px; opacity:0; transition:opacity .3s; pointer-events:none; z-index:10; }
+  #toast.show { opacity:1; }
+
+  @media (max-width: 800px) {
+    #app { grid-template-columns: 1fr; grid-template-rows: auto auto 1fr; height:auto; min-height:100%; }
+    #stage { padding:8px; }
+    #boardWrap { max-width:none; }
+    aside { border-left:0; border-top:1px solid var(--line); }
+    #chat { min-height:220px; }
+    .tools { margin-left:0; width:100%; }
+  }
+</style>
+</head>
+<body>
+
+<div id="lobby">
+  <div class="card">
+    <h1>🎨 Рисувай Заедно</h1>
+    <p>Рисувайте на едно платно от няколко устройства в реално време.</p>
+    <label for="nameInput">Твоето име</label>
+    <input id="nameInput" maxlength="16" placeholder="напр. Мартин">
+    <button id="createBtn">Създай нова стая</button>
+    <div class="or">— или влез в съществуваща —</div>
+    <label for="codeInput">Код на стая</label>
+    <div class="row">
+      <input id="codeInput" maxlength="5" placeholder="ABCDE">
+      <button id="joinBtn">Влез</button>
+    </div>
+    <div id="lobbyMsg"></div>
+  </div>
+</div>
+
+<div id="app" class="hidden">
+  <header>
+    <div>Стая <span class="room" id="roomCode"></span></div>
+    <button class="secondary" id="copyBtn" style="padding:6px 10px;font-size:13px">Копирай линк</button>
+    <div class="status"><span class="dot" id="dot"></span><span id="statusText">свързване…</span></div>
+    <div class="tools" id="tools"></div>
+  </header>
+  <div id="stage">
+    <div id="boardWrap">
+      <canvas id="board" width="1600" height="1000"></canvas>
+    </div>
+  </div>
+  <aside>
+    <section>
+      <h3>Играчи (<span id="playerCount">0</span>)</h3>
+      <ul id="players"></ul>
+    </section>
+    <section>
+      <div id="qr"></div>
+    </section>
+    <div id="chat">
+      <h3>Чат</h3>
+      <div id="messages"></div>
+      <form id="chatForm">
+        <input id="chatInput" maxlength="200" placeholder="Напиши съобщение…" autocomplete="off">
+        <button>➤</button>
+      </form>
+    </div>
+  </aside>
+</div>
+<div id="toast"></div>
+
+<script>
+const PREFIX = 'risuvai-zaedno-v1-';
+const COLORS = ['#222222','#e53935','#fb8c00','#fdd835','#43a047','#1e88e5','#8e24aa','#ff80ab','#795548'];
+const PLAYER_COLORS = ['#e53935','#1e88e5','#43a047','#fb8c00','#8e24aa','#00897b','#d81b60','#6d4c41','#3949ab','#c0ca33'];
+const $ = id => document.getElementById(id);
+
+let peer, isHost = false, roomCode = '', myId = '', myName = '', myColor = '';
+let hostConn = null;            // guest -> host connection
+const conns = new Map();        // host: peerId -> DataConnection
+const players = new Map();      // id -> {name, color}
+let strokes = [];               // host: full history for late joiners
+const lastSeen = new Map();     // host: peerId -> last message time (heartbeat)
+let hostLastSeen = Date.now();  // guest: last message from host
+let brush = { color: COLORS[0], size: 6, eraser: false };
+
+/* ---------- Lobby ---------- */
+const params = new URLSearchParams(location.search);
+if (params.get('room')) $('codeInput').value = params.get('room').toUpperCase();
+$('nameInput').value = localStorageGet('name') || '';
+
+$('createBtn').onclick = () => start(true);
+$('joinBtn').onclick = () => start(false);
+$('codeInput').addEventListener('keydown', e => { if (e.key === 'Enter') start(false); });
+
+function localStorageGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
+function localStorageSet(k, v) { try { localStorage.setItem(k, v); } catch {} }
+
+function randomCode() {
+  const a = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  return Array.from({ length: 5 }, () => a[Math.floor(Math.random() * a.length)]).join('');
+}
+
+function start(asHost) {
+  myName = $('nameInput').value.trim() || 'Гост' + Math.floor(Math.random() * 100);
+  localStorageSet('name', myName);
+  $('lobbyMsg').textContent = '';
+  if (asHost) {
+    isHost = true;
+    roomCode = randomCode();
+    myColor = PLAYER_COLORS[0];
+    createPeer(PREFIX + roomCode);
+  } else {
+    roomCode = $('codeInput').value.trim().toUpperCase();
+    if (roomCode.length !== 5) { $('lobbyMsg').textContent = 'Въведи 5-символен код на стая.'; return; }
+    isHost = false;
+    createPeer(undefined);
+  }
+}
+
+function createPeer(id) {
+  $('createBtn').disabled = $('joinBtn').disabled = true;
+  $('lobbyMsg').style.color = '#777';
+  $('lobbyMsg').textContent = 'Свързване със сървъра…';
+  peer = id ? new Peer(id) : new Peer();
+
+  peer.on('open', pid => {
+    myId = pid;
+    if (isHost) {
+      players.set(myId, { name: myName, color: myColor });
+      enterApp();
+      setStatus(true, 'ти си домакин');
+      sysMsg('Стаята е създадена. Покани други с кода ' + roomCode + ' или QR кода.');
+    } else {
+      joinRoom();
+    }
+  });
+
+  peer.on('connection', conn => { if (isHost) handleGuest(conn); else conn.close(); });
+
+  peer.on('error', err => {
+    console.error(err);
+    if (err.type === 'unavailable-id') { peer.destroy(); start(true); return; } // code collision, try another
+    if (err.type === 'peer-unavailable') { lobbyError('Няма стая с код ' + roomCode + '.'); return; }
+    if ($('app').classList.contains('hidden')) lobbyError('Грешка при свързване: ' + err.type);
+    else toast('Грешка: ' + err.type);
+  });
+
+  peer.on('disconnected', () => { if (!peer.destroyed) peer.reconnect(); });
+}
+
+function lobbyError(msg) {
+  $('lobbyMsg').style.color = '#c62828';
+  $('lobbyMsg').textContent = msg;
+  $('createBtn').disabled = $('joinBtn').disabled = false;
+  if (peer) peer.destroy();
+}
+
+/* ---------- Host side ---------- */
+function handleGuest(conn) {
+  conn.on('open', () => {
+    conns.set(conn.peer, conn);
+    lastSeen.set(conn.peer, Date.now());
+  });
+  conn.on('data', msg => { lastSeen.set(conn.peer, Date.now()); onHostData(conn, msg); });
+  conn.on('close', () => removeGuest(conn.peer));
+  conn.on('error', () => removeGuest(conn.peer));
+}
+
+function removeGuest(id) {
+  if (!conns.has(id)) return;
+  try { conns.get(id).close(); } catch {}
+  conns.delete(id);
+  lastSeen.delete(id);
+  const p = players.get(id);
+  players.delete(id);
+  removeCursor(id);
+  renderPlayers();
+  if (p) { sysMsg(p.name + ' излезе'); broadcast({ t: 'leave', id, name: p.name }); }
+  broadcast({ t: 'players', list: [...players] });
+}
+
+function onHostData(conn, msg) {
+  switch (msg.t) {
+    case 'hello': {
+      const used = new Set([...players.values()].map(p => p.color));
+      const color = PLAYER_COLORS.find(c => !used.has(c)) || PLAYER_COLORS[players.size % PLAYER_COLORS.length];
+      players.set(conn.peer, { name: String(msg.name).slice(0, 16), color });
+      conn.send({ t: 'welcome', you: conn.peer, color, strokes, players: [...players] });
+      broadcast({ t: 'players', list: [...players] }, conn.peer);
+      broadcast({ t: 'join', name: msg.name }, conn.peer);
+      renderPlayers();
+      sysMsg(msg.name + ' влезе');
+      break;
+    }
+    case 'seg':
+      strokes.push(msg.s);
+      drawSeg(msg.s);
+      broadcast(msg, conn.peer);
+      break;
+    case 'clear':
+      strokes = []; clearBoard();
+      broadcast(msg, conn.peer);
+      sysMsg((players.get(conn.peer)?.name || '?') + ' изчисти платното');
+      break;
+    case 'chat': {
+      const p = players.get(conn.peer);
+      if (!p) return;
+      const out = { t: 'chat', name: p.name, color: p.color, text: String(msg.text).slice(0, 200) };
+      chatMsg(out);
+      broadcast(out, conn.peer);
+      break;
+    }
+    case 'ping': break;
+    case 'bye': removeGuest(conn.peer); break;
+    case 'cursor':
+      msg.id = conn.peer;
+      showCursor(msg.id, msg.x, msg.y);
+      broadcast(msg, conn.peer);
+      break;
+  }
+}
+
+function broadcast(msg, exceptId) {
+  for (const [id, c] of conns) if (id !== exceptId && c.open) c.send(msg);
+}
+
+/* ---------- Guest side ---------- */
+function joinRoom() {
+  $('lobbyMsg').textContent = 'Влизане в стая ' + roomCode + '…';
+  hostConn = peer.connect(PREFIX + roomCode, { reliable: true });
+  const timeout = setTimeout(() => { if (!hostConn.open) lobbyError('Стаята не отговаря. Провери кода.'); }, 15000);
+  hostConn.on('open', () => {
+    clearTimeout(timeout);
+    hostConn.send({ t: 'hello', name: myName });
+  });
+  hostConn.on('data', onGuestData);
+  hostConn.on('close', hostGone);
+}
+
+function hostGone() {
+  if (!hostConn || hostConn._gone) return;
+  hostConn._gone = true;
+  setStatus(false, 'връзката с домакина е прекъсната');
+  sysMsg('Домакинът напусна. Стаята е затворена.');
+}
+
+function onGuestData(msg) {
+  hostLastSeen = Date.now();
+  switch (msg.t) {
+    case 'ping': break;
+    case 'bye': hostGone(); break;
+    case 'welcome':
+      myColor = msg.color;
+      enterApp();
+      setStatus(true, 'свързан');
+      players.clear(); msg.players.forEach(([id, p]) => players.set(id, p));
+      renderPlayers();
+      msg.strokes.forEach(drawSeg);
+      sysMsg('Влезе в стая ' + roomCode);
+      break;
+    case 'players':
+      players.clear(); msg.list.forEach(([id, p]) => players.set(id, p));
+      renderPlayers();
+      break;
+    case 'join': sysMsg(msg.name + ' влезе'); break;
+    case 'leave': sysMsg(msg.name + ' излезе'); removeCursor(msg.id); break;
+    case 'seg': drawSeg(msg.s); break;
+    case 'clear': clearBoard(); sysMsg('Платното беше изчистено'); break;
+    case 'chat': chatMsg(msg); break;
+    case 'cursor': showCursor(msg.id, msg.x, msg.y); break;
+  }
+}
+
+/* send from me (host or guest) */
+function send(msg) {
+  if (isHost) broadcast(msg);
+  else if (hostConn && hostConn.open) hostConn.send(msg);
+}
+
+/* ---------- App UI ---------- */
+function enterApp() {
+  $('lobby').classList.add('hidden');
+  $('app').classList.remove('hidden');
+  $('roomCode').textContent = roomCode;
+  history.replaceState(null, '', '?room=' + roomCode);
+  buildTools();
+  renderPlayers();
+  renderQR();
+}
+
+function joinLink() { return location.origin + location.pathname + '?room=' + roomCode; }
+
+function renderQR() {
+  try {
+    const qr = qrcode(0, 'M');
+    qr.addData(joinLink()); qr.make();
+    $('qr').innerHTML = qr.createImgTag(4, 0) + '<div>Сканирай с телефон, за да влезеш в стаята.</div>';
+  } catch (e) { $('qr').textContent = joinLink(); }
+}
+
+$('copyBtn').onclick = async () => {
+  try { await navigator.clipboard.writeText(joinLink()); toast('Линкът е копиран'); }
+  catch { prompt('Копирай линка:', joinLink()); }
+};
+
+function setStatus(on, text) { $('dot').classList.toggle('on', on); $('statusText').textContent = text; }
+
+function renderPlayers() {
+  $('playerCount').textContent = players.size;
+  $('players').innerHTML = '';
+  for (const [id, p] of players) {
+    const li = document.createElement('li');
+    li.innerHTML = '<i></i><span></span>';
+    li.querySelector('i').style.background = p.color;
+    li.querySelector('span').textContent = p.name + (id === myId ? ' (ти)' : '') + (id === PREFIX + roomCode ? ' 👑' : '');
+    $('players').appendChild(li);
+  }
+}
+
+function buildTools() {
+  const t = $('tools'); t.innerHTML = '';
+  COLORS.forEach((c, i) => {
+    const b = document.createElement('button');
+    b.className = 'swatch' + (i === 0 ? ' active' : '');
+    b.style.background = c; b.title = c;
+    b.onclick = () => { brush.color = c; brush.eraser = false; updateToolUI(b); };
+    t.appendChild(b);
+  });
+  const size = document.createElement('input');
+  size.type = 'range'; size.min = 2; size.max = 40; size.value = brush.size; size.title = 'Дебелина';
+  size.oninput = () => brush.size = +size.value;
+  t.appendChild(size);
+  const er = document.createElement('button'); er.textContent = 'Гума'; er.id = 'eraserBtn'; er.className = 'secondary';
+  er.onclick = () => { brush.eraser = !brush.eraser; updateToolUI(); };
+  t.appendChild(er);
+  const cl = document.createElement('button'); cl.textContent = 'Изчисти'; cl.className = 'secondary';
+  cl.onclick = () => { if (!confirm('Да изчистя ли платното за всички?')) return; clearBoard(); if (isHost) strokes = []; send({ t: 'clear' }); };
+  t.appendChild(cl);
+  const sv = document.createElement('button'); sv.textContent = 'Запази'; sv.className = 'secondary';
+  sv.onclick = () => { const a = document.createElement('a'); a.download = 'risunka-' + roomCode + '.png'; a.href = board.toDataURL(); a.click(); };
+  t.appendChild(sv);
+}
+
+function updateToolUI(activeSwatch) {
+  if (activeSwatch) document.querySelectorAll('.swatch').forEach(s => s.classList.toggle('active', s === activeSwatch));
+  $('eraserBtn').classList.toggle('active', brush.eraser);
+}
+
+/* ---------- Drawing ---------- */
+const board = $('board');
+const ctx = board.getContext('2d');
+ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+let last = null, lastCursorSent = 0;
+
+function clearBoard() { ctx.clearRect(0, 0, board.width, board.height); }
+
+function drawSeg(s) {
+  ctx.globalCompositeOperation = s.e ? 'destination-out' : 'source-over';
+  ctx.strokeStyle = s.c; ctx.lineWidth = s.w;
+  ctx.beginPath(); ctx.moveTo(s.x0, s.y0); ctx.lineTo(s.x1, s.y1); ctx.stroke();
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function pos(e) {
+  const r = board.getBoundingClientRect();
+  return { x: Math.round((e.clientX - r.left) * board.width / r.width), y: Math.round((e.clientY - r.top) * board.height / r.height) };
+}
+
+board.addEventListener('pointerdown', e => {
+  board.setPointerCapture(e.pointerId);
+  last = pos(e);
+  addSeg(last, { x: last.x + 0.1, y: last.y }); // dot on tap
+});
+board.addEventListener('pointermove', e => {
+  const p = pos(e);
+  const now = performance.now();
+  if (now - lastCursorSent > 50) { lastCursorSent = now; send({ t: 'cursor', id: myId, x: p.x / board.width, y: p.y / board.height }); }
+  if (!last) return;
+  addSeg(last, p);
+  last = p;
+});
+['pointerup', 'pointercancel', 'pointerleave'].forEach(ev => board.addEventListener(ev, () => last = null));
+
+function addSeg(a, b) {
+  const s = { x0: a.x, y0: a.y, x1: b.x, y1: b.y, c: brush.color, w: brush.eraser ? brush.size * 3 : brush.size, e: brush.eraser ? 1 : 0 };
+  drawSeg(s);
+  if (isHost) strokes.push(s);
+  send({ t: 'seg', s });
+}
+
+/* ---------- Cursors ---------- */
+const cursors = new Map();
+function showCursor(id, x, y) {
+  if (id === myId) return;
+  const p = players.get(id); if (!p) return;
+  let el = cursors.get(id);
+  if (!el) {
+    el = document.createElement('div'); el.className = 'cursor';
+    el.innerHTML = '<i></i><span></span>';
+    $('boardWrap').appendChild(el); cursors.set(id, el);
+  }
+  el.querySelector('i').style.background = p.color;
+  const sp = el.querySelector('span'); sp.style.background = p.color; sp.textContent = p.name;
+  el.style.left = (x * 100) + '%'; el.style.top = (y * 100) + '%';
+  clearTimeout(el._t); el.style.opacity = 1;
+  el._t = setTimeout(() => el.style.opacity = 0, 3000);
+}
+function removeCursor(id) { const el = cursors.get(id); if (el) { el.remove(); cursors.delete(id); } }
+
+/* ---------- Chat ---------- */
+$('chatForm').addEventListener('submit', e => {
+  e.preventDefault();
+  const text = $('chatInput').value.trim();
+  if (!text) return;
+  $('chatInput').value = '';
+  const msg = { t: 'chat', name: myName, color: myColor, text };
+  chatMsg(msg);
+  send(msg);
+});
+
+function chatMsg(m) {
+  const d = document.createElement('div');
+  const b = document.createElement('b'); b.style.color = m.color; b.textContent = m.name + ': ';
+  d.appendChild(b); d.appendChild(document.createTextNode(m.text));
+  appendMsg(d);
+}
+function sysMsg(text) { const d = document.createElement('div'); d.className = 'sys'; d.textContent = text; appendMsg(d); }
+function appendMsg(d) { $('messages').appendChild(d); $('messages').scrollTop = 1e9; }
+
+function toast(text) { const t = $('toast'); t.textContent = text; t.classList.add('show'); clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove('show'), 2000); }
+
+/* ---------- Heartbeat: detect devices that vanish without saying goodbye ---------- */
+setInterval(() => {
+  if (!peer || $('app').classList.contains('hidden')) return;
+  send({ t: 'ping' });
+  const now = Date.now();
+  if (isHost) { for (const [id, t] of lastSeen) if (now - t > 7000) removeGuest(id); }
+  else if (hostConn && hostConn.open && now - hostLastSeen > 7000) hostGone();
+}, 2000);
+
+window.addEventListener('pagehide', () => { try { send({ t: 'bye' }); } catch {} if (peer) peer.destroy(); });
+</script>
+</body>
+</html>
